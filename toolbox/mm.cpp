@@ -241,14 +241,35 @@ namespace MM
 			//if (size == 0) return 0;
 
 			uint8_t *ptr = nullptr;
-			ptr = (uint8_t *)mplite_malloc(&pool, size ? size : 1);
+			// Over-allocate large pointers so SetPtrSize can grow them in
+			// place. The classic Memory Manager compacts the heap (moving
+			// relocatable handles) to grow a pointer; mplite blocks are
+			// immovable, so give big blocks headroom instead -- MPW Pascal
+			// grows its symbol table pointer in ~16K steps and treats a
+			// grow failure as fatal.
+			if (size >= 0x1000)
+			{
+				for (int mult = 16; mult >= 2; mult >>= 1)
+				{
+					uint64_t want = (uint64_t)size * mult;
+					if (want > 0x40000000) continue;
+					ptr = (uint8_t *)mplite_malloc(&pool, (int)want);
+					if (ptr) break;
+				}
+			}
+			if (!ptr)
+				ptr = (uint8_t *)mplite_malloc(&pool, size ? size : 1);
 			if (!ptr)
 			{
 				return SetMemError(MacOS::memFullErr);
 			}
 
-			if (clear)
-				std::memset(ptr, 0, size);
+			// Always zero fresh blocks: a real Mac heap hands out stale
+			// bytes, and MPW Pascal's behavior visibly depends on them
+			// (nondeterministic "type conflict" errors). Zero-fill keeps
+			// every run deterministic.
+			(void)clear;
+			std::memset(ptr, 0, size);
 
 			mcptr = ptr - Memory;
 			PtrMap.emplace(std::make_pair(mcptr, size));
@@ -307,8 +328,8 @@ namespace MM
 				}
 				mcptr = ptr - Memory;
 
-				if (clear)
-					std::memset(ptr, 0, size);
+				(void)clear;
+				std::memset(ptr, 0, size);
 			//}
 
 			// need a handle -> ptr map?

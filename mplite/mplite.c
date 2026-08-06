@@ -167,12 +167,16 @@ MPLITE_API void *mplite_realloc(mplite_t *handle, const void *pPrior,
     return p;
 }
 
-// like realloc but will not resize.
+// like realloc but will not move the block: grows IN PLACE when the buddy
+// chain above the block is free (classic Mac SetPtrSize can grow a pointer
+// when free space follows it; MPW Pascal grows its symbol-table pointer
+// this way and treats failure as fatal).
 // for compatibility with MM::SetPtrSize
 MPLITE_API int mplite_resize(mplite_t *handle, const void *pPrior,
                              const int nBytes)
 {
     int nOld;
+    int iBlock, iLogsize, iWantLog;
 
     /* Check the parameters */
     if ((NULL == handle) || (NULL == pPrior) || (nBytes <= 0) ||
@@ -185,7 +189,37 @@ MPLITE_API int mplite_resize(mplite_t *handle, const void *pPrior,
         return MPLITE_OK;
     }
 
-    return MPLITE_ERR_INVPAR; // not really, but ok.
+    mplite_enter(handle);
+
+    iBlock = (int)((const uint8_t *) pPrior - handle->zPool) / handle->szAtom;
+    iLogsize = handle->aCtrl[iBlock] & MPLITE_CTRL_LOGSIZE;
+    for (iWantLog = 0; (handle->szAtom << iWantLog) < nBytes; iWantLog++);
+
+    /* Grow one doubling at a time: the block must be the LOWER buddy and
+     ** its sibling must be one maximally-coalesced free chunk (the buddy
+     ** allocator merges eagerly on free, so a fully free sibling is exactly
+     ** one chunk of our size). */
+    while (iLogsize < iWantLog) {
+        int iBuddy = iBlock ^ (1 << iLogsize);
+        if ((iBlock & ((1 << (iLogsize + 1)) - 1)) != 0 ||
+            iWantLog > MPLITE_LOGMAX ||
+            iBuddy >= handle->nBlock ||
+            handle->aCtrl[iBuddy] != (uint8_t)(MPLITE_CTRL_FREE | iLogsize)) {
+            mplite_leave(handle);
+            return MPLITE_ERR_INVPAR;
+        }
+        mplite_unlink(handle, iBuddy, iLogsize);
+        iLogsize++;
+        handle->aCtrl[iBlock] = (uint8_t) iLogsize;
+        handle->aCtrl[iBuddy] = 0;
+        handle->currentOut += (handle->szAtom << (iLogsize - 1));
+        if (handle->currentOut > handle->maxOut) {
+            handle->maxOut = handle->currentOut;
+        }
+    }
+
+    mplite_leave(handle);
+    return MPLITE_OK;
 }
 
 /* return the largest available block size */
