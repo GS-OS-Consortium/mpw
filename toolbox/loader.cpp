@@ -29,8 +29,7 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
-
-#include <CoreServices/CoreServices.h>
+#include <cassert>
 
 #include <cpu/defs.h>
 #include <cpu/CpuModule.h>
@@ -230,30 +229,13 @@ namespace Loader {
 		uint16_t LoadFile(const std::string &path)
 		{
 
-			HFSUniStr255 fork = {0,{0}};
-			ResFileRefNum refNum;
-			FSRef ref;
-			OSErr err;
+			uint16_t err;
 
 			// open the file
 			// load code seg 0
 			// iterate and load other segments
 
-
-			// TODO -- call RM::Native::OpenResourceFile(...);
-
-			err = FSPathMakeRef( (const UInt8 *)path.c_str(), &ref, NULL);
-			if (err) return err;
-
-
-			::FSGetResourceForkName(&fork);
-
-			err = ::FSOpenResourceFile(&ref,
-				fork.length,
-				fork.unicode,
-				fsRdPerm,
-				&refNum);
-
+			err = RM::Native::OpenResourceFile(path);
 			if (err) return err;
 
 

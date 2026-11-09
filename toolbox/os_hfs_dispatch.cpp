@@ -34,9 +34,7 @@
 #include <string>
 #include <cstring>
 
-#include <sys/xattr.h>
 #include <sys/stat.h>
-#include <sys/paths.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -228,18 +226,21 @@ namespace OS {
 			memoryWriteWord(0, parm + _ioFlParID);
 			memoryWriteWord(0, parm + _ioFlClpSiz);
 
-			sname.append(_PATH_RSRCFORKSPEC);
-			if (::stat(sname.c_str(), &st) >= 0)
+			{
+			struct stat rst;
+			std::string rname = sname + ".rsrc";
+			if (::stat(rname.c_str(), &rst) >= 0)
 			{
 				memoryWriteWord(0, parm + _ioFlRStBlk);
-				memoryWriteLong(st.st_size, parm + _ioFlRLgLen);
-				memoryWriteLong(st.st_size, parm + _ioFlRPyLen);
+				memoryWriteLong(rst.st_size, parm + _ioFlRLgLen);
+				memoryWriteLong(rst.st_size, parm + _ioFlRPyLen);
 			}
 			else
 			{
 				memoryWriteWord(0, parm + _ioFlRStBlk);
 				memoryWriteLong(0, parm + _ioFlRLgLen);
 				memoryWriteLong(0, parm + _ioFlRPyLen);
+			}
 			}
 		}
 		return 0;

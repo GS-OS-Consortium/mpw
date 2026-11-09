@@ -38,9 +38,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include <CoreServices/CoreServices.h>
-
 #include <cpu/defs.h>
+
+#include <macos/resfork.h>
 #include <cpu/CpuModule.h>
 #include <cpu/fmem.h>
 
@@ -180,9 +180,6 @@ void relocate(uint32_t address, uint32_t size, uint32_t a5)
 uint32_t load(const char *file)
 {
 
-	ResFileRefNum refNum;
-	FSRef ref;
-
 	uint32_t returnAddress = 0;
 
 	struct SegInfo {
@@ -208,42 +205,31 @@ uint32_t load(const char *file)
 	uint32_t jtStart = 0;
 	uint32_t jtEnd = 0;
 
-	// todo -- call RM::Native to open and load the Resource File.
+	MacOS::ResFork fork;
+	std::string forkError;
+	if (!fork.read(std::string(file) + ".rsrc", forkError))
+	{
+		fprintf(stderr, "Unable to open %s.rsrc: %s\n", file, forkError.c_str());
+		return 0;
+	}
 
-	assert(FSPathMakeRef( (const UInt8 *)file, &ref, NULL) == noErr);
-	// todo -- if it wasn't a resource file, this will fail
-	// should provide a nicer error message.
-    refNum = FSOpenResFile(&ref, fsRdPerm);
-    assert(refNum != -1 );
+	std::vector<const MacOS::ResItem *> codes;
+	for (size_t i = 0; i < fork.items.size(); ++i)
+		if (fork.items[i].type == 0x434f4445) codes.push_back(&fork.items[i]);
+	segments.reserve(codes.size());
+	assert(!codes.empty());
 
-	int l = Count1Resources('CODE');
-	segments.reserve(l);
-
-	assert(l > 0);
-
-    for (int i = 0; i < l; ++i)
+    for (size_t i = 0; i < codes.size(); ++i)
     {
-		ResAttributes attr;
-		ResID resID;
-		ResType resType;
-		Str255 name;
+		uint16_t resID;
 		uint32_t size;
 		uint32_t address;
-		Handle h;
 		const uint8_t *data;
-
 		uint16_t error;
 
-
-		h = Get1IndResource('CODE', i + 1);
-		if (!h) continue;
-		HLock(h);
-		data = *(const uint8_t **)h;
-
-		attr = GetResAttrs(h);
-		GetResInfo(h, &resID, &resType, name);
-
-		size = GetHandleSize(h);
+		data = codes[i]->data.data();
+		resID = (uint16_t)codes[i]->id;
+		size = (uint32_t)codes[i]->data.size();
 
 		if (segments.size() <= resID) segments.resize(resID + 1);
 		// can't have duplicate resIDs, so no need to check that...
@@ -300,8 +286,6 @@ uint32_t load(const char *file)
 
 			segments[resID] = SegInfo(address, size, farModel);
 		}
-
-		ReleaseResource(h);
     }
 
     // now link the segment 0 jump table...

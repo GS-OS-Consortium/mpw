@@ -29,6 +29,7 @@
 #include "toolbox.h"
 
 #include <macos/errors.h>
+#include <macos/resfork.h>
 
 #include <stdexcept>
 #include <cerrno>
@@ -40,7 +41,7 @@
 #include <fcntl.h>
 #include <sys/xattr.h>
 #include <sys/attr.h>
-#include <sys/paths.h>
+#include <sys/stat.h>
 
 #include <machine/endian.h>
 
@@ -93,19 +94,15 @@ namespace OS { namespace Internal {
 		// todo -- move to separate function? used in multiple places.
 		uint8_t buffer[32];
 		std::memset(buffer, 0, sizeof(buffer));
-		int rv;
 
-		rv = ::getxattr(pathName.c_str(), XATTR_FINDERINFO_NAME, buffer, 32, 0, 0);
+		struct stat st;
+		if (::stat(pathName.c_str(), &st) < 0)
+			return macos_error_from_errno();
 
-		if (rv < 0)
+		// A missing sidecar is thirty-two zero bytes. ProDOS xattrs still
+		// fill the type when no sidecar was written.
+		if (!MacOS::readFinderInfo(pathName, buffer))
 		{
-			switch (errno)
-			{
-				case ENOENT:
-				case EACCES:
-					return macos_error_from_errno();
-			}
-
 			// check for prodos ftype/auxtype
 			uint8_t ftype;
 			uint16_t atype;
@@ -246,7 +243,10 @@ namespace OS { namespace Internal {
 	{
 		uint8_t buffer[32];
 		std::memset(buffer, 0, sizeof(buffer));
-		int rv;
+
+		struct stat st;
+		if (::stat(pathName.c_str(), &st) < 0)
+			return macos_error_from_errno();
 
 		if (extended)
 		{
@@ -255,17 +255,7 @@ namespace OS { namespace Internal {
 		}
 		else
 		{
-			rv = ::getxattr(pathName.c_str(), XATTR_FINDERINFO_NAME, buffer, 32, 0, 0);
-
-			if (rv < 0)
-			{
-				switch (errno)
-				{
-					case ENOENT:
-					case EACCES:
-						return macos_error_from_errno();
-				}
-			}
+			MacOS::readFinderInfo(pathName, buffer);
 			std::memmove(buffer, info, 16);
 
 		}
@@ -285,8 +275,7 @@ namespace OS { namespace Internal {
 			}
 		}
 
-		rv = ::setxattr(pathName.c_str(), XATTR_FINDERINFO_NAME, buffer, 32, 0, 0);
-		if (rv < 0) return macos_error_from_errno();
+		if (!MacOS::writeFinderInfo(pathName, buffer)) return MacOS::ioErr;
 
 		return 0;
 	}
@@ -549,7 +538,7 @@ namespace OS { namespace Internal {
 
 		std::string xname = filename;
 		if (fork) {
-			xname.append(_PATH_RSRCFORKSPEC);
+			xname.append(".rsrc");
 			// O_RDWR should also O_CREAT
 		}
 

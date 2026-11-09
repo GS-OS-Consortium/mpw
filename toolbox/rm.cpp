@@ -26,18 +26,24 @@
 
 #include <string>
 #include <cstring>
+#include <cstdio>
 #include <list>
 #include <map>
-#include <unordered_set>
+#include <vector>
+#include <algorithm>
 
 #include <unistd.h>
-
-#include <CoreServices/CoreServices.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #include "rm.h"
 #include "toolbox.h"
 #include "mm.h"
 #include "os_internal.h"
+
+#include <macos/resfork.h>
 
 #include <cpu/defs.h>
 #include <cpu/CpuModule.h>
@@ -63,57 +69,139 @@ namespace
 
 	bool ResLoad = true;
 
-
-	// https://developer.apple.com/library/mac/documentation/Carbon/Reference/CoreEndianReference/
-
-	OSStatus FlipperNoFlipping(OSType dataDomain, OSType dataType, SInt16 id, void *dataPtr, ByteCount dataSize, Boolean currentlyNative, void *refCon)
-	{
-		return 0;
-	}
-
-	void BypassResourceFlipper(OSType dataType)
-	{
-		static std::unordered_set<OSType> Types;
-
-		if (Types.find(dataType) != Types.end()) return;
-
-		CoreEndianFlipProc proc;
-		void *refCon;
-
-		if (::CoreEndianGetFlipper(kCoreEndianResourceManagerDomain, dataType, &proc, &refCon) == 0)
-		{
-			::CoreEndianInstallFlipper(kCoreEndianResourceManagerDomain, dataType,  FlipperNoFlipping, nullptr);
-			//fprintf(stderr, "Endian Flipper was installed for resource '%s'\n", TypeToString(dataType).c_str());
-		}
-
-		Types.insert(dataType);
-	}
-
-#if 0
-	struct ResEntry
-	{
-		ResEntry(uint32_t type = 0, uint32_t id = 0) :
-			resType(type), resID(id)
-		{}
-		uint32_t resType;
-		uint32_t resID;
-		uint32_t handle;
-	};
-
-	std::list<ResEntry> ResourceMapList;
-#endif
-	// sigh... really need to create a resmap for every open
-	// resource file and update that with the pointer.
-
-
-	std::map<uint32_t, Handle> rhandle_map;
-
-
 	inline uint16_t SetResError(uint16_t error)
 	{
 		memoryWriteWord(error, MacOS::ResErr);
 		return error;
 	}
+
+	// Guest handle -> resource. The resource bytes live in the open file.
+	struct ResKey
+	{
+		uint16_t file;
+		uint32_t type;
+		int16_t id;
+	};
+
+	struct OpenItem
+	{
+		MacOS::ResItem item;
+		uint32_t handle;
+	};
+
+	struct OpenFile
+	{
+		std::string path;
+		std::string forkPath;
+		uint16_t ref;
+		uint16_t attrs;
+		std::vector<OpenItem> items;
+		bool dirty;
+	};
+
+	struct Store
+	{
+		std::map<uint16_t, OpenFile> files;
+		std::vector<uint16_t> chain; // back() is the current file
+		std::map<uint32_t, ResKey> handles;
+		uint16_t nextRef;
+
+		Store() : nextRef(2) {}
+
+		OpenFile *byRef(uint16_t ref)
+		{
+			auto it = files.find(ref);
+			if (it == files.end()) return nullptr;
+			return &it->second;
+		}
+
+		OpenFile *current()
+		{
+			if (chain.empty()) return nullptr;
+			return byRef(chain.back());
+		}
+	};
+
+	Store &store()
+	{
+		static Store s;
+		return s;
+	}
+
+	std::string canonPath(const std::string &path)
+	{
+		char buf[PATH_MAX];
+		if (::realpath(path.c_str(), buf)) return buf;
+		return path;
+	}
+
+	void useFile(uint16_t ref)
+	{
+		std::vector<uint16_t> &c = store().chain;
+		c.erase(std::remove(c.begin(), c.end(), ref), c.end());
+		c.push_back(ref);
+	}
+
+	OpenItem *findItem(OpenFile &f, uint32_t type, int16_t id)
+	{
+		for (size_t i = 0; i < f.items.size(); ++i)
+			if (f.items[i].item.type == type && f.items[i].item.id == id)
+				return &f.items[i];
+		return nullptr;
+	}
+
+	uint16_t flushFile(OpenFile &f)
+	{
+		MacOS::ResFork fork;
+		fork.fileAttrs = f.attrs;
+		fork.items.reserve(f.items.size());
+		for (size_t i = 0; i < f.items.size(); ++i)
+			fork.items.push_back(f.items[i].item);
+		std::string error;
+		if (!fork.write(f.forkPath, error)) return MacOS::ioErr;
+		f.dirty = false;
+		return 0;
+	}
+
+	uint16_t publish(OpenFile &f, OpenItem &it, uint32_t &theHandle)
+	{
+		// Each GetResource allocates a new guest handle. PascalIIGS calls
+		// GetResource with SetResLoad(false) to read the on-disk size, releases
+		// that handle, then gets the resource again with SetResLoad(true).
+		// Reusing the unloaded handle would hand back zero bytes.
+		uint32_t ptr = 0;
+		uint32_t size = ResLoad ? (uint32_t)it.item.data.size() : 0;
+		uint16_t error = MM::Native::NewHandle(size, false, theHandle, ptr);
+		if (!theHandle) return SetResError(error);
+		MM::Native::HSetRBit(theHandle);
+		if (size)
+			std::memcpy(memoryPointer(ptr), it.item.data.data(), size);
+		it.handle = theHandle;
+		store().handles[theHandle] = ResKey{f.ref, it.item.type, it.item.id};
+		return SetResError(0);
+	}
+
+	// Copies the guest handle back into the map and writes the sidecar.
+	uint16_t storeHandle(uint32_t theHandle, bool write)
+	{
+		auto hit = store().handles.find(theHandle);
+		if (hit == store().handles.end()) return SetResError(MacOS::resNotFound);
+		OpenFile *f = store().byRef(hit->second.file);
+		if (!f) return SetResError(MacOS::resNotFound);
+		OpenItem *it = findItem(*f, hit->second.type, hit->second.id);
+		if (!it) return SetResError(MacOS::resNotFound);
+
+		auto info = MM::GetHandleInfo(theHandle);
+		if (info.error()) return SetResError(info.error());
+		it->item.data.resize(info->size);
+		if (info->size)
+			std::memcpy(it->item.data.data(), memoryPointer(info->address), info->size);
+		it->item.attrs = (uint8_t)(it->item.attrs | 0x02);
+		f->dirty = true;
+		if (!write) return SetResError(0);
+		return SetResError(flushFile(*f));
+	}
+
 
 	bool LoadResType(uint32_t type)
 	{
@@ -156,78 +244,75 @@ namespace RM
 
 
 
+	uint16_t getById(uint32_t type, int16_t id, bool topOnly, uint32_t &theHandle)
+	{
+		theHandle = 0;
+		if (!LoadResType(type)) return SetResError(MacOS::resNotFound);
+		Store &s = store();
+		if (s.chain.empty()) return SetResError(MacOS::resNotFound);
+		for (int i = (int)s.chain.size() - 1; i >= 0; --i)
+		{
+			OpenFile *f = s.byRef(s.chain[i]);
+			if (!f) continue;
+			OpenItem *it = findItem(*f, type, id);
+			if (it) return publish(*f, *it, theHandle);
+			if (topOnly) break;
+		}
+		return SetResError(MacOS::resNotFound);
+	}
+
+	uint16_t getByName(uint32_t type, const std::string &name, bool topOnly, uint32_t &theHandle)
+	{
+		theHandle = 0;
+		if (!LoadResType(type)) return SetResError(MacOS::resNotFound);
+		Store &s = store();
+		if (s.chain.empty()) return SetResError(MacOS::resNotFound);
+		for (int i = (int)s.chain.size() - 1; i >= 0; --i)
+		{
+			OpenFile *f = s.byRef(s.chain[i]);
+			if (!f) continue;
+			for (size_t k = 0; k < f->items.size(); ++k)
+			{
+				if (f->items[k].item.type == type && f->items[k].item.name == name)
+					return publish(*f, f->items[k], theHandle);
+			}
+			if (topOnly) break;
+		}
+		return SetResError(MacOS::resNotFound);
+	}
+
+	uint16_t getInd(uint32_t type, uint16_t index, uint32_t &theHandle)
+	{
+		theHandle = 0;
+		OpenFile *f = store().current();
+		if (!f || index == 0) return SetResError(MacOS::resNotFound);
+		uint16_t n = 0;
+		for (size_t k = 0; k < f->items.size(); ++k)
+		{
+			if (f->items[k].item.type != type) continue;
+			if (++n == index) return publish(*f, f->items[k], theHandle);
+		}
+		return SetResError(MacOS::resNotFound);
+	}
+
 	namespace Native
 	{
-
-		// not to be confused with MacOS LoadResource(theHandle)
-
-		template<class FX>
-		uint16_t LoadResource(uint32_t type, uint32_t &theHandle, FX fx)
-		{
-			uint32_t ptr;
-			uint16_t error;
-
-			Handle nativeHandle;
-			uint32_t size;
-
-			theHandle = 0;
-
-
-			if (!LoadResType(type))
-				return SetResError(resNotFound);
-
-			BypassResourceFlipper(type);
-
-			nativeHandle = fx();
-
-			if (!nativeHandle) return SetResError(resNotFound);
-
-			// in OS X 10.8, ::SetResLoad(false) seems to be permanent.
-			// therefore, explicitly load it if needed. (PascalIIgs)
-			if (ResLoad) ::LoadResource(nativeHandle);
-
-			size = ::GetHandleSize(nativeHandle);
-			error = MM::Native::NewHandle(size, false, theHandle, ptr);
-			// TODO -- need to lock if native handle locked.
-
-			if (!theHandle)
-			{
-				::ReleaseResource(nativeHandle);
-				return SetResError(error);
-			}
-			MM::Native::HSetRBit(theHandle);
-
-			if (size)
-				std::memcpy(memoryPointer(ptr), *(void **)nativeHandle, size);
-
-			//::ReleaseResource(nativeHandle);
-
-			rhandle_map.insert({theHandle, nativeHandle});
-
-			return SetResError(0);
-		}
-
 
 		// used by GetString (utility.h)
 		// used by Loader.
 		uint16_t GetResource(uint32_t type, uint16_t id, uint32_t &theHandle)
 		{
-			return LoadResource(type, theHandle,
-				[type, id](){
-					return ::GetResource(type, id);
-				});
+			return getById(type, (int16_t)id, false, theHandle);
 		}
 
 		uint16_t SetResLoad(bool load)
 		{
-
 			ResLoad = load;
-			::SetResLoad(load);
-
 			memoryWriteByte(load ? 0xff : 0x00, MacOS::ResLoad); // word or byte?
 			return SetResError(0);
 		}
 
+		uint16_t OpenResourceFile(const std::string &path);
 
 	}
 
@@ -244,8 +329,19 @@ namespace RM
 
 		if (refNum != 0)
 		{
-			::CloseResFile(refNum);
-			return SetResError(::ResError());
+			Store &s = store();
+			OpenFile *f = s.byRef(refNum);
+			if (!f) return SetResError(MacOS::resFNotFound);
+			uint16_t err = 0;
+			if (f->dirty) err = flushFile(*f);
+			for (auto it = s.handles.begin(); it != s.handles.end(); )
+			{
+				if (it->second.file == refNum) it = s.handles.erase(it);
+				else ++it;
+			}
+			s.chain.erase(std::remove(s.chain.begin(), s.chain.end(), refNum), s.chain.end());
+			s.files.erase(refNum);
+			return SetResError(err);
 		}
 		return SetResError(0);
 		//return SetResError(resFNotFound);
@@ -282,14 +378,10 @@ namespace RM
 
 		uint32_t resourceHandle;
 		uint32_t d0;
-		d0 = Native::LoadResource(theType, resourceHandle,
-			[theType, name](){
-				return ::Get1NamedResource(theType, memoryPointer(name));
-			}
-		);
+		d0 = getByName(theType, sname, true, resourceHandle);
 
 		ToolReturn<4>(sp, resourceHandle);
-		return SetResError(d0);
+		return d0;
 	}
 
 	uint16_t GetNamedResource(uint16_t trap)
@@ -309,14 +401,10 @@ namespace RM
 
 		uint32_t resourceHandle;
 		uint32_t d0;
-		d0 = Native::LoadResource(theType, resourceHandle,
-			[theType, name](){
-				return ::GetNamedResource(theType, memoryPointer(name));
-			}
-		);
+		d0 = getByName(theType, sname, false, resourceHandle);
 
 		ToolReturn<4>(sp, resourceHandle);
-		return SetResError(d0);
+		return d0;
 	}
 
 	uint16_t GetResource(uint16_t trap)
@@ -348,11 +436,7 @@ namespace RM
 
 		uint32_t resourceHandle;
 		uint32_t d0;
-		d0 = Native::LoadResource(theType, resourceHandle,
-			[theType, theID](){
-				return ::GetResource(theType, theID);
-			}
-		);
+		d0 = getById(theType, (int16_t)theID, false, resourceHandle);
 
 		ToolReturn<4>(sp, resourceHandle);
 		return d0;
@@ -387,11 +471,7 @@ namespace RM
 
 		uint32_t resourceHandle;
 		uint32_t d0;
-		d0 = Native::LoadResource(theType, resourceHandle,
-			[theType, theID](){
-				return ::Get1Resource(theType, theID);
-			}
-		);
+		d0 = getById(theType, (int16_t)theID, true, resourceHandle);
 
 
 		ToolReturn<4>(sp, resourceHandle);
@@ -440,11 +520,7 @@ namespace RM
 
 		Log("%04x SetResLoad(%04x)\n", trap, load);
 
-		ResLoad = load;
-		::SetResLoad(load);
-
-		memoryWriteByte(load ? 0xff : 0x00, MacOS::ResLoad); // word or byte?
-		return SetResError(0);
+		return Native::SetResLoad(load);
 	}
 
 
@@ -456,10 +532,10 @@ namespace RM
 
 		Log("%04x CurResFile()\n", trap);
 
-		ResFileRefNum refNum = ::CurResFile();
+		uint16_t refNum = store().chain.empty() ? 0 : store().chain.back();
 
 		ToolReturn<2>(-1, refNum);
-		return SetResError(::ResError());
+		return SetResError(0);
 	}
 
 	uint16_t UseResFile(uint16_t trap)
@@ -470,8 +546,10 @@ namespace RM
 
 		Log("%04x UseResFile(%04x)\n", trap, resFile);
 
-		::UseResFile(resFile);
-		return SetResError(::ResError());
+		if (resFile == 0 || !store().byRef(resFile))
+			return SetResError(MacOS::resFNotFound);
+		useFile(resFile);
+		return SetResError(0);
 	}
 
 
@@ -480,12 +558,10 @@ namespace RM
 
 		if (path.empty()) return MacOS::paramErr;
 
-		FSRef ref;
-		OSErr error;
 		int fd;
 
-		// FSPathMakeRef only works with existing files.
-		// FSCreateResourceFork only works with existing files.
+		// Creating the data fork does not create the resource fork, and the
+		// reverse. An existing non-empty sidecar is a duplicate fork.
 
 		fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
 		if (fd < 0)
@@ -500,24 +576,18 @@ namespace RM
 			close(fd);
 		}
 
+		std::string forkPath = MacOS::rsrcPath(path);
+		struct stat st;
+		if (::stat(forkPath.c_str(), &st) == 0)
+			return MacOS::dupFNErr;
 
-		error = ::FSPathMakeRef((const UInt8 *)path.c_str(), &ref, NULL);
-		if (error != noErr)
-			return macos_error(error);
-
-
-		HFSUniStr255 fork = {0,{0}};
-		::FSGetResourceForkName(&fork);
-
-
-		error = ::FSCreateResourceFork(&ref, fork.length, fork.unicode, 0);
-
-		// CreateResFile returns an error if the fork exists, HCreateResFile
-		// and FSpCreateResFile do not.
-
-
-		if (error == errFSForkExists) error = MacOS::dupFNErr;
-		return macos_error(error);
+		std::vector<uint8_t> empty = MacOS::ResFork::emptyFork();
+		fd = ::open(forkPath.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
+		if (fd < 0) return macos_error_from_errno();
+		ssize_t n = ::write(fd, empty.data(), empty.size());
+		close(fd);
+		if (n != (ssize_t)empty.size()) return MacOS::ioErr;
+		return MacOS::noErr;
 	}
 
 	uint16_t CreateResFile(uint16_t trap)
@@ -620,28 +690,55 @@ namespace RM
 
 	tool_return<int16_t> OpenResCommon(const std::string &path, uint16_t permission = 0)
 	{
-		OSErr error;
-		FSRef ref;
-		ResFileRefNum refNum;
+		(void)permission;
+		if (path.empty()) return MacOS::paramErr;
+		if (::access(path.c_str(), F_OK) != 0) return macos_error_from_errno();
 
-		error = ::FSPathMakeRef( (const UInt8 *)path.c_str(), &ref, NULL);
-		if (error != noErr)
-			return (MacOS::macos_error)error;
+		std::string canon = canonPath(path);
+		Store &s = store();
+		for (auto it = s.files.begin(); it != s.files.end(); ++it)
+		{
+			if (it->second.path == canon)
+			{
+				useFile(it->first);
+				return (int16_t)it->first;
+			}
+		}
 
-		HFSUniStr255 fork = {0,{0}};
-		::FSGetResourceForkName(&fork);
+		std::string forkPath = MacOS::rsrcPath(canon);
+		// FSOpenResourceFile reports eofErr when the data file exists and the
+		// resource fork does not. PascalIIGS treats that as "create it" and
+		// any other error as fatal.
+		if (::access(forkPath.c_str(), F_OK) != 0) return MacOS::eofErr;
 
-		refNum = -1;
-		error = ::FSOpenResourceFile(&ref,
-			fork.length,
-			fork.unicode,
-			permission,
-			&refNum);
+		MacOS::ResFork fork;
+		std::string error;
+		if (!fork.read(forkPath, error)) return MacOS::mapReadErr;
 
-		if (error != noErr)
-			return (MacOS::macos_error)error;
+		OpenFile f;
+		f.path = canon;
+		f.forkPath = forkPath;
+		f.ref = s.nextRef++;
+		if (f.ref == 0) f.ref = s.nextRef++;
+		f.attrs = fork.fileAttrs;
+		f.dirty = false;
+		f.items.reserve(fork.items.size());
+		for (size_t i = 0; i < fork.items.size(); ++i)
+		{
+			OpenItem item;
+			item.item = fork.items[i];
+			item.handle = 0;
+			f.items.push_back(item);
+		}
+		uint16_t ref = f.ref;
+		s.files.insert(std::make_pair(ref, f));
+		s.chain.push_back(ref);
+		return (int16_t)ref;
+	}
 
-		return refNum;
+	uint16_t Native::OpenResourceFile(const std::string &path)
+	{
+		return OpenResCommon(path).error();
 	}
 
 	uint16_t OpenResFile(uint16_t trap)
@@ -740,14 +837,10 @@ namespace RM
 	{
 		// FUNCTION OpenRFPerm (fileName: Str255; vRefNum: Integer;
         //           permission: SignedByte): Integer;
-		ResFileRefNum refNum;
-		FSRef ref;
-
 		uint32_t sp;
 		uint32_t fileName;
 		uint16_t vRefNum;
 		uint16_t permission;
-		OSErr error;
 
 		sp = StackFrame<8>(fileName, vRefNum, permission);
 
@@ -755,26 +848,9 @@ namespace RM
 		Log("%04x OpenRFPerm(%s, %04x, %04x)\n",
 			trap, sname.c_str(), vRefNum, permission);
 
-		error = ::FSPathMakeRef( (const UInt8 *)sname.c_str(), &ref, NULL);
-		if (error != noErr)
-		{
-			ToolReturn<2>(sp, (uint16_t)-1);
-			return SetResError(error);
-		}
-
-        HFSUniStr255 fork = {0,{0}};
-        ::FSGetResourceForkName(&fork);
-
-        refNum = -1;
-    	error = ::FSOpenResourceFile(&ref,
-    		fork.length,
-    		fork.unicode,
-    		permission,
-    		&refNum);
-
-		ToolReturn<2>(sp, (uint16_t)refNum);
-
-		return SetResError(error);
+		auto rv = OpenResCommon(sname, permission);
+		ToolReturn<2>(sp, rv.value_or(-1));
+		return SetResError(rv.error());
 	}
 
 	uint16_t Count1Resources(uint16_t trap)
@@ -790,7 +866,13 @@ namespace RM
 		Log("%04x Count1Resources(%08x ('%s'))\n",
 			trap, theType, TypeToString(theType).c_str());
 
-		count = ::Count1Resources(theType);
+		count = 0;
+		OpenFile *f = store().current();
+		if (f)
+		{
+			for (size_t i = 0; i < f->items.size(); ++i)
+				if (f->items[i].item.type == theType) count++;
+		}
 
 		ToolReturn<2>(sp, count);
 		return SetResError(0);
@@ -807,9 +889,10 @@ namespace RM
 
 		Log("%04x UpdateResFile(%04x)\n", trap, refNum);
 
-		::UpdateResFile(refNum);
-
-		return SetResError(::ResError());
+		OpenFile *f = refNum == 0 ? store().current() : store().byRef(refNum);
+		if (!f) return SetResError(MacOS::resFNotFound);
+		if (!f->dirty) return SetResError(0);
+		return SetResError(flushFile(*f));
 	}
 
 
@@ -830,36 +913,9 @@ namespace RM
 		// since the data has changed....
 
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end())
-		{
-			return SetResError(MacOS::resNotFound);
-		}
-
-		Handle nativeHandle = iter->second;
-
-		// check if handle size changed, resync data
-
-		auto info = MM::GetHandleInfo(theResource);
-		if (!info.error()) return SetResError(info.error());
-
-
-		uint32_t nativeSize = ::GetHandleSize(nativeHandle);
-
-		if (nativeSize != info->size) {
-			// resize...
-			// could get state / unlock / set state ... but that does nothing in OS X.
-
-			::SetHandleSize(nativeHandle, info->size);
-			OSErr err = MemError();
-			if (err) return SetResError(err);
-		}
-
-		std::memcpy(*nativeHandle, memoryPointer(info->address), info->size);
-
-		::ChangedResource(nativeHandle);
-
-		return SetResError(::ResError());
+		// Write through. The next unit reads the cache this unit just stored,
+		// and nothing in the emulator flushes resource files at process exit.
+		return storeHandle(theResource, true);
 	}
 
 
@@ -876,10 +932,16 @@ namespace RM
 		sp = StackFrame<2>(refNum);
 		Log("%04x GetResFileAttrs(%04x)\n", trap, refNum);
 
-		attrs = ::GetResFileAttrs(refNum);
+		OpenFile *f = store().byRef(refNum);
+		if (!f)
+		{
+			ToolReturn<2>(sp, 0);
+			return SetResError(MacOS::resFNotFound);
+		}
+		attrs = f->attrs;
 		ToolReturn<2>(sp, attrs);
 
-		return SetResError(::ResError());
+		return SetResError(0);
 	}
 
 
@@ -893,9 +955,11 @@ namespace RM
 		sp = StackFrame<4>(refNum, attrs);
 		Log("%04x GetResFileAttrs(%04x, %04x)\n", trap, refNum, attrs);
 
-		::SetResFileAttrs(refNum, attrs);
-
-		return SetResError(::ResError());
+		OpenFile *f = store().byRef(refNum);
+		if (!f) return SetResError(MacOS::resFNotFound);
+		f->attrs = attrs;
+		f->dirty = true;
+		return SetResError(flushFile(*f));
 	}
 
 	// TODO -- update rhandle_map when loading resources
@@ -920,25 +984,28 @@ namespace RM
 			trap, theData, theType, TypeToString(theType).c_str(), theID, sname.c_str()
 		);
 
-		BypassResourceFlipper(theType);
-
-		Handle nativeHandle = NULL;
+		OpenFile *f = store().current();
+		if (!f || !theData) return SetResError(MacOS::addResFailed);
+		if (findItem(*f, theType, (int16_t)theID)) return SetResError(MacOS::addResFailed);
+		if (store().handles.find(theData) != store().handles.end())
+			return SetResError(MacOS::addResFailed);
 
 		auto info = MM::GetHandleInfo(theData);
 		if (info.error()) return SetResError(MacOS::addResFailed);
 
-
-		nativeHandle = ::NewHandle(info->size);
-		if (!nativeHandle) return SetResError(MacOS::addResFailed);
-
-
-		std::memcpy(*(uint8_t **)nativeHandle, memoryPointer(info->address), info->size);
-
-		rhandle_map.insert({theData, nativeHandle});
-
-		// AddResource assumes ownership of the handle.
-		::AddResource(nativeHandle, theType, theID, memoryPointer(namePtr));
-		return SetResError(::ResError());
+		OpenItem item;
+		item.item.type = theType;
+		item.item.id = (int16_t)theID;
+		item.item.attrs = 0x02;
+		item.item.name = sname;
+		item.item.data.resize(info->size);
+		if (info->size)
+			std::memcpy(item.item.data.data(), memoryPointer(info->address), info->size);
+		item.handle = theData;
+		f->items.push_back(item);
+		store().handles[theData] = ResKey{f->ref, theType, (int16_t)theID};
+		f->dirty = true;
+		return SetResError(flushFile(*f));
 	}
 
 	uint16_t SetResAttrs(uint16_t trap)
@@ -954,14 +1021,14 @@ namespace RM
 
 		// find the native handle..
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end()) return SetResError(MacOS::resNotFound);
-
-		Handle nativeHandle = iter->second;
-
-		::SetResAttrs(nativeHandle, attrs);
-
-		return SetResError(::ResError());
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end()) return SetResError(MacOS::resNotFound);
+		OpenFile *f = store().byRef(hit->second.file);
+		OpenItem *it = f ? findItem(*f, hit->second.type, hit->second.id) : nullptr;
+		if (!it) return SetResError(MacOS::resNotFound);
+		it->item.attrs = (uint8_t)attrs;
+		f->dirty = true;
+		return SetResError(flushFile(*f));
 	}
 
 	uint16_t GetResAttrs(uint16_t trap)
@@ -976,20 +1043,24 @@ namespace RM
 
 		Log("%04x GetResAttrs(%08x)\n", trap, theResource);
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end())
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end())
 		{
 			ToolReturn<2>(sp, 0);
 			return SetResError(MacOS::resNotFound);
 		}
-
-		Handle nativeHandle = iter->second;
-
-		attrs = ::GetResAttrs(nativeHandle);
+		OpenFile *f = store().byRef(hit->second.file);
+		OpenItem *it = f ? findItem(*f, hit->second.type, hit->second.id) : nullptr;
+		if (!it)
+		{
+			ToolReturn<2>(sp, 0);
+			return SetResError(MacOS::resNotFound);
+		}
+		attrs = it->item.attrs;
 
 		ToolReturn<2>(sp, attrs);
 
-		return SetResError(::ResError());
+		return SetResError(0);
 	}
 
 
@@ -1003,15 +1074,7 @@ namespace RM
 		Log("%04x WriteResource(%08x)\n", trap, theResource);
 
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end()) return SetResError(MacOS::resNotFound);
-
-		Handle nativeHandle = iter->second;
-
-		// todo -- need to verify handle size, re-copy handle memory?
-		::WriteResource(nativeHandle);
-
-		return SetResError(::ResError());
+		return storeHandle(theResource, true);
 	}
 
 
@@ -1026,16 +1089,13 @@ namespace RM
 		Log("%04x DetachResource(%08x)\n", trap, theResource);
 
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end()) return SetResError(MacOS::resNotFound);
-
-		Handle nativeHandle = iter->second;
-
-		rhandle_map.erase(iter);
-
-		::ReleaseResource(nativeHandle);
-
-		return SetResError(::ResError());
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end()) return SetResError(MacOS::resNotFound);
+		OpenFile *f = store().byRef(hit->second.file);
+		OpenItem *it = f ? findItem(*f, hit->second.type, hit->second.id) : nullptr;
+		if (it) it->handle = 0;
+		store().handles.erase(hit);
+		return SetResError(0);
 	}
 
 
@@ -1053,14 +1113,10 @@ namespace RM
 
 		uint32_t resourceHandle = 0;
 		uint16_t d0;
-		d0 = Native::LoadResource(theType, resourceHandle,
-			[theType, index](){
-				return ::Get1IndResource(theType, index);
-			}
-		);
+		d0 = getInd(theType, index, resourceHandle);
 
 		ToolReturn<4>(sp, resourceHandle);
-		return SetResError(d0);
+		return d0;
 	}
 
 
@@ -1075,16 +1131,19 @@ namespace RM
 		Log("%04x RemoveResource(%08x)\n", trap, theResource);
 
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end()) return SetResError(MacOS::resNotFound);
-
-		Handle nativeHandle = iter->second;
-		rhandle_map.erase(iter);
-
-		::RemoveResource(nativeHandle);
-		::DisposeHandle(nativeHandle);
-
-		return SetResError(::ResError());
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end()) return SetResError(MacOS::resNotFound);
+		ResKey key = hit->second;
+		OpenFile *f = store().byRef(key.file);
+		if (!f) return SetResError(MacOS::resNotFound);
+		std::vector<OpenItem> &items = f->items;
+		items.erase(std::remove_if(items.begin(), items.end(),
+			[&](const OpenItem &it) {
+				return it.item.type == key.type && it.item.id == key.id;
+			}), items.end());
+		store().handles.erase(hit);
+		f->dirty = true;
+		return SetResError(flushFile(*f));
 	}
 
 	uint16_t GetResourceSizeOnDisk(uint16_t trap)
@@ -1099,18 +1158,22 @@ namespace RM
 		Log("%04x GetResourceSizeOnDisk(%08x)\n", trap, theResource);
 
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end())
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end())
+		{
+			ToolReturn<4>(sp, (uint32_t)0);
+			return SetResError(MacOS::resNotFound);
+		}
+		OpenFile *f = store().byRef(hit->second.file);
+		OpenItem *it = f ? findItem(*f, hit->second.type, hit->second.id) : nullptr;
+		if (!it)
 		{
 			ToolReturn<4>(sp, (uint32_t)0);
 			return SetResError(MacOS::resNotFound);
 		}
 
-		Handle nativeHandle = iter->second;
-		uint32_t size = ::GetResourceSizeOnDisk(nativeHandle);
-
-		ToolReturn<4>(sp, size);
-		return SetResError(::ResError());
+		ToolReturn<4>(sp, (uint32_t)it->item.data.size());
+		return SetResError(0);
 	}
 
 	uint16_t GetResInfo(uint16_t trap)
@@ -1126,28 +1189,20 @@ namespace RM
 
 		Log("%04x GetResInfo(%08x)\n", trap, theResource);
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end())
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end())
 		{
 			return SetResError(MacOS::resNotFound);
 		}
+		OpenFile *f = store().byRef(hit->second.file);
+		OpenItem *it = f ? findItem(*f, hit->second.type, hit->second.id) : nullptr;
+		if (!it) return SetResError(MacOS::resNotFound);
 
-		Handle nativeHandle = iter->second;
-		ResID nativeID = 0;
-		ResType nativeType = 0;
-		Str255 nativeName = {0};
+		if (theID) memoryWriteWord((uint16_t)it->item.id, theID);
+		if (theType) memoryWriteLong(it->item.type, theType);
+		if (name) ToolBox::WritePString(name, it->item.name);
 
-		::GetResInfo(nativeHandle, &nativeID, &nativeType, nativeName);
-
-		if (theID) memoryWriteWord(nativeID, theID);
-		if (theType) memoryWriteLong(nativeType, theType);
-		if (name)
-		{
-			std::string sname(nativeName + 1, nativeName + 1 + nativeName[0]);
-			ToolBox::WritePString(name, sname);
-		}
-
-		return SetResError(::ResError());
+		return SetResError(0);
 	}
 
 	uint16_t LoadResource(uint16_t trap)
@@ -1160,50 +1215,35 @@ namespace RM
 		// this needs cooperation with MM to check if
 		// handle was purged.
 
-		OSErr err;
 		uint32_t theResource;
 
 		StackFrame<4>(theResource);
 
 		Log("%04x LoadResource(%08x)\n", trap, theResource);
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end())
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end())
 		{
 			return SetResError(MacOS::resNotFound);
 		}
-
+		OpenFile *f = store().byRef(hit->second.file);
+		OpenItem *it = f ? findItem(*f, hit->second.type, hit->second.id) : nullptr;
+		if (!it) return SetResError(MacOS::resNotFound);
 
 		// if it has a size, it's loaded...
 		auto info = MM::GetHandleInfo(theResource);
-		if (info.error()) return SetResError(resNotFound);
+		if (info.error()) return SetResError(MacOS::resNotFound);
 		if (info->size) return SetResError(0);
 
-		// otherwise, load it
-
-		Handle nativeHandle;
-		uint32_t size;
-
-		nativeHandle = iter->second;
-
-
-		::LoadResource(nativeHandle);
-		err = ::ResError();
+		uint32_t size = (uint32_t)it->item.data.size();
+		uint16_t err = MM::Native::ReallocHandle(theResource, size);
 		if (err) return SetResError(err);
-
-
-		size = ::GetHandleSize(nativeHandle);
-
-		err = MM::Native::ReallocHandle(theResource, size);
-		if (err) return SetResError(err);
-
-		// todo -- need to lock if resource locked.
 
 		if (size)
 		{
 			info = MM::GetHandleInfo(theResource);
-
-			std::memcpy(memoryPointer(info->address), *(void **)nativeHandle, size);
+			if (info.error()) return SetResError(info.error());
+			std::memcpy(memoryPointer(info->address), it->item.data.data(), size);
 		}
 
 		return SetResError(0);
@@ -1224,18 +1264,18 @@ namespace RM
 		Log("%04x HomeResFile(%08x)\n", trap, theResource);
 
 
-		auto iter = rhandle_map.find(theResource);
-		if (iter == rhandle_map.end())
+		auto hit = store().handles.find(theResource);
+		if (hit == store().handles.end())
 		{
 			ToolReturn<2>(sp, -1);
 			return SetResError(MacOS::resNotFound);
 		}
 
-		resFile = ::HomeResFile(iter->second);
+		resFile = hit->second.file;
 
 		ToolReturn<2>(sp, resFile);
 
-		return SetResError(::ResError());
+		return SetResError(0);
 	}
 
 	uint16_t Count1Types(uint16_t trap)
@@ -1246,11 +1286,28 @@ namespace RM
 
 		Log("%04x Count1Types\n", trap);
 
-		count = ::Count1Types();
+		count = 0;
+		OpenFile *f = store().current();
+		if (f)
+		{
+			std::vector<uint32_t> seen;
+			for (size_t i = 0; i < f->items.size(); ++i)
+			{
+				uint32_t type = f->items[i].item.type;
+				bool found = false;
+				for (size_t k = 0; k < seen.size(); ++k)
+					if (seen[k] == type) found = true;
+				if (!found)
+				{
+					seen.push_back(type);
+					count++;
+				}
+			}
+		}
 
 		ToolReturn<2>(-1, count);
 
-		return SetResError(::ResError());
+		return SetResError(0);
 	}
 
 
@@ -1265,12 +1322,24 @@ namespace RM
 
 		Log("%04x Get1IndType(%08x, %04x)\n", trap, theType, index);
 
-		ResType nativeType = 0;
-
-		::Get1IndType(&nativeType, index);
+		uint32_t nativeType = 0;
+		OpenFile *f = store().current();
+		if (f && index != 0)
+		{
+			std::vector<uint32_t> seen;
+			for (size_t i = 0; i < f->items.size(); ++i)
+			{
+				uint32_t type = f->items[i].item.type;
+				bool found = false;
+				for (size_t k = 0; k < seen.size(); ++k)
+					if (seen[k] == type) found = true;
+				if (!found) seen.push_back(type);
+			}
+			if (index <= seen.size()) nativeType = seen[index - 1];
+		}
 
 		memoryWriteLong(nativeType, theType);
 
-		return SetResError(::ResError());
+		return SetResError(nativeType ? 0 : MacOS::resNotFound);
 	}
 }

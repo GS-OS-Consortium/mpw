@@ -32,9 +32,9 @@
 #include <deque>
 #include <string>
 
-#include <sys/xattr.h>
 #include <sys/stat.h>
-#include <sys/paths.h>
+
+#include <macos/resfork.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -126,11 +126,9 @@ namespace OS
 
 		// 1. check for a TEXT file type.
 		{
-			int rv;
-			char buffer[32];
+			uint8_t buffer[32];
 
-			rv = ::getxattr(s.c_str(), XATTR_FINDERINFO_NAME, buffer, 32, 0, 0);
-			if (rv >= 8 && memcmp(buffer, "TEXT", 4) == 0)
+			if (MacOS::readFinderInfo(s, buffer) && memcmp(buffer, "TEXT", 4) == 0)
 				return true;
 		}
 
@@ -234,11 +232,8 @@ namespace OS
 		// first -- check for a finder info extension.
 		{
 			uint8_t buffer[32];
-			int rv;
 
-			rv = ::getxattr(s.c_str(), XATTR_FINDERINFO_NAME, buffer, 32, 0, 0);
-
-			if (rv >= 8 && ::memcmp(buffer + 4, "pdos",4) == 0)
+			if (MacOS::readFinderInfo(s, buffer) && ::memcmp(buffer + 4, "pdos",4) == 0)
 			{
 				// Bx__ ?
 				if (buffer[0] == 'B' && buffer[2] == ' ' && buffer[3] == ' ')

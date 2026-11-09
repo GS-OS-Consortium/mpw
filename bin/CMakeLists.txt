@@ -68,12 +68,10 @@ target_link_libraries(mpw MPLITE_LIB)
 target_link_libraries(mpw MACOS_LIB)
 
 target_link_libraries(mpw -ledit)
-target_link_libraries(mpw "-framework Carbon")
 
 add_executable(disasm disasm.cpp)
 target_link_libraries(disasm CPU_LIB)
 target_link_libraries(disasm MACOS_LIB)
-target_link_libraries(disasm "-framework Carbon")
 
 install(
   PROGRAMS

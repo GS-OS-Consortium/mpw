@@ -32,9 +32,9 @@
 #include <deque>
 #include <string>
 
-#include <sys/xattr.h>
 #include <sys/stat.h>
-#include <sys/paths.h>
+
+#include <macos/resfork.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -68,21 +68,15 @@ namespace {
 
 	uint32_t rforksize(const std::string &path)
 	{
-		ssize_t rv;
-
-		rv = getxattr(path.c_str(), XATTR_RESOURCEFORK_NAME, nullptr, 0, 0, 0);
-		if (rv < 0) return 0;
-		return rv;
+		struct stat st;
+		if (::stat(MacOS::rsrcPath(path).c_str(), &st) < 0) return 0;
+		if (!S_ISREG(st.st_mode)) return 0;
+		return (uint32_t)st.st_size;
 	}
 
-	uint32_t rforksize(int fd)
+	uint32_t rforksize(int)
 	{
-		ssize_t rv;
-
-		rv = fgetxattr(fd, XATTR_RESOURCEFORK_NAME, nullptr, 0, 0, 0);
-		if (rv < 0) return 0;
-		return rv;
-
+		return 0;
 	}
 
 }

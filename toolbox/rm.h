@@ -2,6 +2,7 @@
 #define __mpw_rm_h__
 
 #include <cstdint>
+#include <string>
 
 namespace RM
 {
@@ -10,6 +11,7 @@ namespace RM
 	{
 		uint16_t SetResLoad(bool tf);
 		uint16_t GetResource(uint32_t type, uint16_t id, uint32_t &theHandle);
+		uint16_t OpenResourceFile(const std::string &path);
 	}
 
 	uint16_t CloseResFile(uint16_t trap);

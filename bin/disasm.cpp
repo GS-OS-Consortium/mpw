@@ -31,9 +31,9 @@
 
 #include <string>
 
-#include <CoreServices/CoreServices.h>
-
 #include <cpu/defs.h>
+
+#include <macos/resfork.h>
 #include <cpu/fmem.h>
 #include <cpu/CpuModule.h>
 
@@ -226,52 +226,29 @@ void disasm(const char *name, int segment, uint32_t data_size)
 int main(int argc, char **argv)
 {
 
-	ResFileRefNum refNum;
-	FSRef ref;
-	Handle h;
-
 	if (argc != 2)
 	{
 		help();
 		return -1;
 	}
 
-	assert( FSPathMakeRef( (const UInt8 *)argv[1], &ref, NULL) == noErr);
-
-    refNum = FSOpenResFile(&ref, fsRdPerm);
-    assert(refNum != -1 );
-    //UseResFile(refNum);
-
+	MacOS::ResFork fork;
+	std::string forkError;
+	if (!fork.read(std::string(argv[1]) + ".rsrc", forkError))
+	{
+		fprintf(stderr, "Unable to open %s.rsrc: %s\n", argv[1], forkError.c_str());
+		return -1;
+	}
 
 	cpuSetModel(3, 0); // 68030
 
-	int l = Count1Resources('CODE');
-
-	for (int i = 0; i < l; ++i)
+	for (size_t i = 0; i < fork.items.size(); ++i)
 	{
-		ResAttributes attr;
-		ResID resID;
-		ResType resType;
-		Str255 name;
-		std::string cname;
-
-		h = Get1IndResource('CODE', i + 1);
-		if (!h) continue;
-		HLock(h);
-
-
-		attr = GetResAttrs(h);
-		GetResInfo(h, &resID, &resType, name);
-
-		// name is a p-string.
-		if (name[0])
-		{
-			int l = name[0];
-			cname.assign(name + 1, name + 1 + l);
-		}
-
-		uint32_t size = GetHandleSize(h);
-		uint8_t *data = *( uint8_t **)h;
+		if (fork.items[i].type != 0x434f4445) continue;
+		int16_t resID = fork.items[i].id;
+		std::string cname = fork.items[i].name;
+		uint32_t size = (uint32_t)fork.items[i].data.size();
+		uint8_t *data = fork.items[i].data.empty() ? nullptr : &fork.items[i].data[0];
 
 		if (resID == 0)
 		{
@@ -297,12 +274,7 @@ int main(int argc, char **argv)
 		}
 
 		memorySetMemory(nullptr, 0);
-
-		ReleaseResource(h);
 	}
-
-
-    CloseResFile(refNum);
 
     return 0;
 }

@@ -40,8 +40,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <sys/paths.h>
-
 #include <cpu/defs.h>
 #include <cpu/fmem.h>
 #include <cpu/CpuModule.h>
@@ -245,7 +243,7 @@ namespace MPW
 			fd = -1;
 			if (parent >= 0) {
 
-				sname.append(_PATH_RSRCFORKSPEC);
+				sname.append(".rsrc");
 
 				nativeFlags &= ~O_EXCL;
 				// APFS, etc - resource fork doesn't automatically exist so 
